@@ -1,6 +1,7 @@
 const express = require('express');
 
 const authRoutes = require('./routes/authRoutes');
+const problemRoutes = require('./routes/problemRoutes');
 
 const app = express();
 
@@ -8,6 +9,7 @@ const app = express();
 app.use(express.json());
 
 app.use('/auth', authRoutes);
+app.use('/problems', problemRoutes);
 
 app.get('/', (_req, res) => {
   res.status(200).json({ message: 'Backend running' });
