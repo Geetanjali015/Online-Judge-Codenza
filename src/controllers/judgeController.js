@@ -1,6 +1,6 @@
 const { validationResult } = require('express-validator');
 
-const judgeService = require('../services/judgeService');
+const { enqueueSubmission } = require('../queues/submissionQueue');
 const submissionService = require('../services/submissionService');
 
 const judgeSubmission = async (req, res) => {
@@ -14,18 +14,25 @@ const judgeSubmission = async (req, res) => {
   }
 
   try {
-    // Reuse the existing owner/admin rule before any submitted code is executed.
-    await submissionService.getSubmissionById(req.params.submissionId, req.user);
-
-    const result = await judgeService.judgeSubmission(req.params.submissionId);
+    // Reuse the existing owner/admin rule before placing a rejudge job in Redis.
     const submission = await submissionService.getSubmissionById(
       req.params.submissionId,
       req.user
     );
 
-    return res.status(200).json({
+    submission.status = 'Queued';
+    submission.verdict = null;
+    submission.passedTestCases = 0;
+    submission.totalTestCases = 0;
+    submission.runtimeMs = null;
+    submission.memoryKb = null;
+    await submission.save();
+
+    await enqueueSubmission(submission._id, { forceNew: true });
+
+    return res.status(202).json({
       success: true,
-      result,
+      message: 'Submission queued for judging',
       submission,
     });
   } catch (error) {
@@ -37,8 +44,8 @@ const judgeSubmission = async (req, res) => {
       return res.status(400).json({ message: error.message });
     }
 
-    console.error('Failed to judge submission:', error);
-    return res.status(500).json({ message: 'Internal server error' });
+    console.error('Failed to queue submission for judging:', error);
+    return res.status(503).json({ message: 'Judging queue is unavailable' });
   }
 };
 

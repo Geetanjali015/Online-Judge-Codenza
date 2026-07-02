@@ -16,7 +16,7 @@ const sendValidationErrors = (req, res) => {
 };
 
 const sendServiceError = (res, error, operation) => {
-  if ([403, 404].includes(error.statusCode)) {
+  if ([403, 404, 503].includes(error.statusCode)) {
     return res.status(error.statusCode).json({ message: error.message });
   }
 

@@ -1,6 +1,7 @@
 const Problem = require('../models/Problem');
 const Submission = require('../models/Submission');
 const User = require('../models/User');
+const { enqueueSubmission } = require('../queues/submissionQueue');
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -42,6 +43,13 @@ const createSubmission = async (userId, problemId, language, code) => {
       console.error('Failed to roll back submission after user update failure:', cleanupError);
     });
     throw error;
+  }
+
+  try {
+    await enqueueSubmission(submission._id);
+  } catch (error) {
+    console.error(`Failed to enqueue submission ${submission._id}:`, error.message);
+    throw createHttpError(503, 'Submission saved but the judging queue is unavailable');
   }
 
   return populateSubmission(submission);
