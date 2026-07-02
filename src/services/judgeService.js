@@ -4,6 +4,7 @@ const { performance } = require('perf_hooks');
 const Docker = require('dockerode');
 
 const HiddenTest = require('../models/HiddenTest');
+const Problem = require('../models/Problem');
 const Submission = require('../models/Submission');
 const User = require('../models/User');
 
@@ -16,16 +17,11 @@ const {
 
 const DOCKER_IMAGE = 'gcc:latest';
 const WORKSPACE_PATH = '/workspace';
-const COMPILE_ERROR_EXIT_CODE = 125;
-const CPP_COMMAND = [
-  'sh',
-  '-c',
-  'g++ -std=c++17 -O2 -pipe main.cpp -o main 2> compile-error.txt; ' +
-    'compile_status=$?; ' +
-    'if [ "$compile_status" -ne 0 ]; then cat compile-error.txt >&2; exit 125; fi; ' +
-    './main < input.txt; runtime_status=$?; ' +
-    'if [ "$runtime_status" -eq 125 ]; then exit 124; fi; exit "$runtime_status"',
-];
+const BYTES_PER_MB = 1024 * 1024;
+const NANO_CPUS_PER_CPU = 1_000_000_000;
+const COMPILE_MEMORY_BYTES = 512 * BYTES_PER_MB;
+const CPP_COMPILE_COMMAND = ['g++', '-std=c++17', '-O2', '-pipe', 'main.cpp', '-o', 'main'];
+const CPP_EXECUTE_COMMAND = ['sh', '-c', './main < input.txt'];
 
 const docker = new Docker();
 let imageReadyPromise;
@@ -75,20 +71,32 @@ const getContainerUser = () => {
   return `${process.getuid()}:${process.getgid()}`;
 };
 
-const createCppContainer = async (tempDirectory) => {
+const createCppContainer = async ({
+  tempDirectory,
+  command,
+  memoryBytes,
+  readOnlyWorkspace,
+}) => {
   const containerUser = getContainerUser();
 
   return docker.createContainer({
     Image: DOCKER_IMAGE,
-    Cmd: CPP_COMMAND,
+    Cmd: command,
     WorkingDir: WORKSPACE_PATH,
     AttachStdout: true,
     AttachStderr: true,
     Tty: false,
     ...(containerUser ? { User: containerUser } : {}),
     HostConfig: {
-      Binds: [`${tempDirectory}:${WORKSPACE_PATH}:rw`],
+      AutoRemove: true,
+      Binds: [
+        `${tempDirectory}:${WORKSPACE_PATH}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
+      ],
+      Memory: memoryBytes,
+      MemorySwap: memoryBytes,
+      NanoCpus: NANO_CPUS_PER_CPU,
       NetworkMode: 'none',
+      Privileged: false,
       ReadonlyRootfs: true,
       CapDrop: ['ALL'],
       PidsLimit: 64,
@@ -100,17 +108,185 @@ const createCppContainer = async (tempDirectory) => {
   });
 };
 
+const createOutputCapture = (outputStream) => {
+  const stdoutStream = new PassThrough();
+  const stderrStream = new PassThrough();
+  const stdoutChunks = [];
+  const stderrChunks = [];
+
+  stdoutStream.on('data', (chunk) => stdoutChunks.push(chunk));
+  stderrStream.on('data', (chunk) => stderrChunks.push(chunk));
+  docker.modem.demuxStream(outputStream, stdoutStream, stderrStream);
+
+  const complete = new Promise((resolve, reject) => {
+    outputStream.once('end', resolve);
+    outputStream.once('error', reject);
+  });
+
+  return {
+    complete,
+    getStderr: () => Buffer.concat(stderrChunks).toString('utf8'),
+    getStdout: () => Buffer.concat(stdoutChunks).toString('utf8'),
+  };
+};
+
+const createMemoryMonitor = async (container) => {
+  try {
+    const stream = await container.stats({ stream: true });
+    let bufferedJson = '';
+    let peakMemoryBytes = 0;
+
+    const processStatsLine = (line) => {
+      if (!line.trim()) return;
+
+      try {
+        const stats = JSON.parse(line);
+        const usage = stats.memory_stats?.usage;
+        if (Number.isFinite(usage)) peakMemoryBytes = Math.max(peakMemoryBytes, usage);
+      } catch {
+        // A partial JSON object remains buffered until the next stream chunk.
+      }
+    };
+
+    stream.on('data', (chunk) => {
+      bufferedJson += chunk.toString('utf8');
+      const lines = bufferedJson.split(/\r?\n/);
+      bufferedJson = lines.pop() || '';
+      lines.forEach(processStatsLine);
+    });
+
+    return {
+      stop: () => {
+        processStatsLine(bufferedJson);
+        stream.destroy();
+        // Docker may emit no sample when a process exits between stats intervals.
+        return peakMemoryBytes > 0 ? Math.ceil(peakMemoryBytes / 1024) : null;
+      },
+    };
+  } catch {
+    // Very short-lived containers can disappear before Docker opens the stats stream.
+    return { stop: () => null };
+  }
+};
+
+const runContainer = async ({
+  tempDirectory,
+  command,
+  memoryBytes,
+  readOnlyWorkspace,
+  timeLimitMs,
+  measureMemory,
+}) => {
+  let container;
+  let timeoutHandle;
+  let memoryMonitor = { stop: () => null };
+
+  try {
+    container = await createCppContainer({
+      tempDirectory,
+      command,
+      memoryBytes,
+      readOnlyWorkspace,
+    });
+
+    const outputStream = await container.attach({
+      stream: true,
+      stdout: true,
+      stderr: true,
+    });
+    const output = createOutputCapture(outputStream);
+
+    await container.start();
+    const startedAt = performance.now();
+    const waitPromise = container.wait();
+    const memoryMonitorPromise = measureMemory
+      ? createMemoryMonitor(container)
+      : Promise.resolve(memoryMonitor);
+
+    let timedOut = false;
+    let executionResult;
+
+    if (timeLimitMs) {
+      const timeoutPromise = new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => resolve({ timedOut: true }), timeLimitMs);
+      });
+      const completed = await Promise.race([
+        waitPromise.then((result) => ({ result })),
+        timeoutPromise,
+      ]);
+
+      if (completed.timedOut) {
+        timedOut = true;
+        try {
+          await container.kill({ signal: 'SIGKILL' });
+        } catch (error) {
+          if (error.statusCode !== 404 && error.statusCode !== 409) throw error;
+        }
+        executionResult = await waitPromise;
+      } else {
+        executionResult = completed.result;
+      }
+    } else {
+      executionResult = await waitPromise;
+    }
+
+    clearTimeout(timeoutHandle);
+    await output.complete;
+    memoryMonitor = await memoryMonitorPromise;
+    const memoryKb = memoryMonitor.stop();
+    const runtimeMs = Math.max(0, Math.round(performance.now() - startedAt));
+    const exitCode = executionResult.StatusCode;
+
+    return {
+      stdout: output.getStdout(),
+      stderr: output.getStderr(),
+      exitCode,
+      timedOut,
+      memoryExceeded: !timedOut && exitCode === 137,
+      runtimeMs,
+      memoryKb,
+    };
+  } finally {
+    clearTimeout(timeoutHandle);
+    memoryMonitor.stop();
+
+    if (container) {
+      try {
+        // AutoRemove normally wins this race; force removal covers setup failures.
+        await container.remove({ force: true });
+      } catch (error) {
+        if (![404, 409].includes(error.statusCode)) {
+          console.error('Failed to remove judge container:', error);
+        }
+      }
+    }
+  }
+};
+
 /**
  * Compiles and executes one C++ source file synchronously inside Docker.
- * This method returns raw process output only; it does not assign a verdict.
+ * It returns raw output plus resource signals; verdict assignment stays in the judge pipeline.
  */
-const executeCode = async ({ language, code, input = '' }) => {
+const executeCode = async ({
+  language,
+  code,
+  input = '',
+  timeLimitMs = 5000,
+  memoryLimitMb = 256,
+}) => {
   if (language !== 'cpp') {
     throw new Error('Judge execution currently supports only cpp');
   }
 
+  if (!Number.isInteger(timeLimitMs) || timeLimitMs <= 0) {
+    throw new TypeError('Time limit must be a positive integer');
+  }
+
+  if (!Number.isInteger(memoryLimitMb) || memoryLimitMb <= 0) {
+    throw new TypeError('Memory limit must be a positive integer');
+  }
+
   let tempDirectory;
-  let container;
 
   try {
     tempDirectory = await createTempDirectory();
@@ -120,49 +296,37 @@ const executeCode = async ({ language, code, input = '' }) => {
     ]);
 
     await ensureDockerImage();
-    container = await createCppContainer(tempDirectory);
-
-    const outputStream = await container.attach({
-      stream: true,
-      stdout: true,
-      stderr: true,
-    });
-    const stdoutStream = new PassThrough();
-    const stderrStream = new PassThrough();
-    const stdoutChunks = [];
-    const stderrChunks = [];
-
-    stdoutStream.on('data', (chunk) => stdoutChunks.push(chunk));
-    stderrStream.on('data', (chunk) => stderrChunks.push(chunk));
-    docker.modem.demuxStream(outputStream, stdoutStream, stderrStream);
-
-    // Attach before starting so even immediate compiler failures are captured.
-    const outputComplete = new Promise((resolve, reject) => {
-      outputStream.once('end', resolve);
-      outputStream.once('error', reject);
+    const compilation = await runContainer({
+      tempDirectory,
+      command: CPP_COMPILE_COMMAND,
+      memoryBytes: COMPILE_MEMORY_BYTES,
+      readOnlyWorkspace: false,
+      measureMemory: false,
     });
 
-    await container.start();
-    const executionResult = await container.wait();
-    await outputComplete;
-
-    return {
-      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-      stderr: Buffer.concat(stderrChunks).toString('utf8'),
-      exitCode: executionResult.StatusCode,
-    };
-  } finally {
-    if (container) {
-      try {
-        await container.remove({ force: true });
-      } catch (error) {
-        // A missing container is already clean; surface every other cleanup failure.
-        if (error.statusCode !== 404) {
-          console.error('Failed to remove judge container:', error);
-        }
-      }
+    if (compilation.exitCode !== 0) {
+      return {
+        stdout: compilation.stdout,
+        stderr: compilation.stderr,
+        exitCode: compilation.exitCode,
+        compilationFailed: true,
+        timedOut: false,
+        memoryExceeded: false,
+        runtimeMs: 0,
+        memoryKb: null,
+      };
     }
 
+    // Await here so the surrounding finally cannot delete files mid-execution.
+    return await runContainer({
+      tempDirectory,
+      command: CPP_EXECUTE_COMMAND,
+      memoryBytes: memoryLimitMb * BYTES_PER_MB,
+      readOnlyWorkspace: true,
+      timeLimitMs,
+      measureMemory: true,
+    });
+  } finally {
     if (tempDirectory) {
       try {
         await deleteTempDirectory(tempDirectory);
@@ -180,8 +344,8 @@ const createHttpError = (statusCode, message) => {
 };
 
 /**
- * Runs all hidden tests sequentially and persists the submission's final result.
- * No output is converted into time-limit or memory-limit verdicts in this phase.
+ * Runs all hidden tests sequentially with the Problem's resource limits and
+ * persists the submission's final result.
  */
 const judgeSubmission = async (submissionId) => {
   const submission = await Submission.findById(submissionId);
@@ -190,6 +354,11 @@ const judgeSubmission = async (submissionId) => {
   if (submission.language !== 'cpp') {
     throw createHttpError(400, 'Judge currently supports only cpp submissions');
   }
+
+  const problem = await Problem.findById(submission.problem)
+    .select('timeLimitMs memoryLimitMb')
+    .lean();
+  if (!problem) throw createHttpError(404, 'Problem not found');
 
   const hiddenTests = await HiddenTest.find({ problem: submission.problem })
     .select('input expectedOutput')
@@ -213,19 +382,34 @@ const judgeSubmission = async (submissionId) => {
   let verdict = 'Accepted';
   let passedTestCases = 0;
   let runtimeMs = 0;
+  let memoryKb = null;
 
   // Tests intentionally run one at a time; no queue or parallel worker is involved.
   for (const hiddenTest of hiddenTests) {
-    const startedAt = performance.now();
     const result = await executeCode({
       language: submission.language,
       code: submission.code,
       input: hiddenTest.input,
+      timeLimitMs: problem.timeLimitMs,
+      memoryLimitMb: problem.memoryLimitMb,
     });
-    runtimeMs += performance.now() - startedAt;
+    runtimeMs += result.runtimeMs;
+    if (result.memoryKb !== null) {
+      memoryKb = Math.max(memoryKb || 0, result.memoryKb);
+    }
 
-    if (result.exitCode === COMPILE_ERROR_EXIT_CODE) {
+    if (result.compilationFailed) {
       verdict = 'Compilation Error';
+      break;
+    }
+
+    if (result.timedOut) {
+      verdict = 'Time Limit Exceeded';
+      break;
+    }
+
+    if (result.memoryExceeded) {
+      verdict = 'Memory Limit Exceeded';
       break;
     }
 
@@ -246,9 +430,8 @@ const judgeSubmission = async (submissionId) => {
   submission.verdict = verdict;
   submission.passedTestCases = passedTestCases;
   submission.totalTestCases = hiddenTests.length;
-  submission.runtimeMs = Math.round(runtimeMs);
-  // Memory measurement and memory-limit verdicts are outside Judge Part 2.
-  submission.memoryKb = null;
+  submission.runtimeMs = runtimeMs;
+  submission.memoryKb = memoryKb;
   await submission.save();
 
   if (verdict === 'Accepted' && !wasAlreadyAccepted) {
