@@ -1,6 +1,11 @@
 const { PassThrough } = require('stream');
+const { performance } = require('perf_hooks');
 
 const Docker = require('dockerode');
+
+const HiddenTest = require('../models/HiddenTest');
+const Submission = require('../models/Submission');
+const User = require('../models/User');
 
 const {
   createTempDirectory,
@@ -11,10 +16,15 @@ const {
 
 const DOCKER_IMAGE = 'gcc:latest';
 const WORKSPACE_PATH = '/workspace';
+const COMPILE_ERROR_EXIT_CODE = 125;
 const CPP_COMMAND = [
   'sh',
   '-c',
-  'g++ -std=c++17 -O2 -pipe main.cpp -o main && ./main < input.txt',
+  'g++ -std=c++17 -O2 -pipe main.cpp -o main 2> compile-error.txt; ' +
+    'compile_status=$?; ' +
+    'if [ "$compile_status" -ne 0 ]; then cat compile-error.txt >&2; exit 125; fi; ' +
+    './main < input.txt; runtime_status=$?; ' +
+    'if [ "$runtime_status" -eq 125 ]; then exit 124; fi; exit "$runtime_status"',
 ];
 
 const docker = new Docker();
@@ -163,6 +173,109 @@ const executeCode = async ({ language, code, input = '' }) => {
   }
 };
 
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+/**
+ * Runs all hidden tests sequentially and persists the submission's final result.
+ * No output is converted into time-limit or memory-limit verdicts in this phase.
+ */
+const judgeSubmission = async (submissionId) => {
+  const submission = await Submission.findById(submissionId);
+  if (!submission) throw createHttpError(404, 'Submission not found');
+
+  if (submission.language !== 'cpp') {
+    throw createHttpError(400, 'Judge currently supports only cpp submissions');
+  }
+
+  const hiddenTests = await HiddenTest.find({ problem: submission.problem })
+    .select('input expectedOutput')
+    .sort({ createdAt: 1 })
+    .lean();
+
+  if (hiddenTests.length === 0) {
+    throw createHttpError(404, 'Hidden tests not found');
+  }
+
+  const wasAlreadyAccepted = submission.verdict === 'Accepted';
+
+  submission.status = 'Running';
+  submission.verdict = null;
+  submission.passedTestCases = 0;
+  submission.totalTestCases = hiddenTests.length;
+  submission.runtimeMs = null;
+  submission.memoryKb = null;
+  await submission.save();
+
+  let verdict = 'Accepted';
+  let passedTestCases = 0;
+  let runtimeMs = 0;
+
+  // Tests intentionally run one at a time; no queue or parallel worker is involved.
+  for (const hiddenTest of hiddenTests) {
+    const startedAt = performance.now();
+    const result = await executeCode({
+      language: submission.language,
+      code: submission.code,
+      input: hiddenTest.input,
+    });
+    runtimeMs += performance.now() - startedAt;
+
+    if (result.exitCode === COMPILE_ERROR_EXIT_CODE) {
+      verdict = 'Compilation Error';
+      break;
+    }
+
+    if (result.exitCode !== 0 || result.stderr.trim().length > 0) {
+      verdict = 'Runtime Error';
+      break;
+    }
+
+    if (result.stdout.trim() !== hiddenTest.expectedOutput.trim()) {
+      verdict = 'Wrong Answer';
+      break;
+    }
+
+    passedTestCases += 1;
+  }
+
+  submission.status = verdict;
+  submission.verdict = verdict;
+  submission.passedTestCases = passedTestCases;
+  submission.totalTestCases = hiddenTests.length;
+  submission.runtimeMs = Math.round(runtimeMs);
+  // Memory measurement and memory-limit verdicts are outside Judge Part 2.
+  submission.memoryKb = null;
+  await submission.save();
+
+  if (verdict === 'Accepted' && !wasAlreadyAccepted) {
+    const previousAcceptedSubmission = await Submission.exists({
+      _id: { $ne: submission._id },
+      user: submission.user,
+      problem: submission.problem,
+      verdict: 'Accepted',
+    });
+
+    if (!previousAcceptedSubmission) {
+      await User.findByIdAndUpdate(submission.user, {
+        $inc: { solvedProblems: 1 },
+      });
+    }
+  }
+
+  return {
+    verdict,
+    passedTestCases,
+    totalTestCases: hiddenTests.length,
+    runtimeMs: submission.runtimeMs,
+    memoryKb: submission.memoryKb,
+  };
+};
+
 module.exports = {
   executeCode,
+  judgeSubmission,
 };
