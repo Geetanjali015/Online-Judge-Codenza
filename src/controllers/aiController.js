@@ -58,7 +58,52 @@ const explainError = async (req, res) => {
   }
 };
 
+const reviewCode = async (req, res) => {
+  if (sendValidationErrors(req, res)) return undefined;
+
+  try {
+    const review = await aiService.reviewSubmissionCode(
+      req.body.submissionId,
+      req.user
+    );
+    return res.status(200).json({ success: true, review });
+  } catch (error) {
+    return sendServiceError(res, error, 'review submission code');
+  }
+};
+
+const suggestOptimizations = async (req, res) => {
+  if (sendValidationErrors(req, res)) return undefined;
+
+  try {
+    const suggestions = await aiService.suggestSubmissionOptimizations(
+      req.body.submissionId,
+      req.user
+    );
+    return res.status(200).json({ success: true, suggestions });
+  } catch (error) {
+    return sendServiceError(res, error, 'suggest submission optimizations');
+  }
+};
+
+const estimateComplexity = async (req, res) => {
+  if (sendValidationErrors(req, res)) return undefined;
+
+  try {
+    const complexity = await aiService.estimateSubmissionComplexity(
+      req.body.submissionId,
+      req.user
+    );
+    return res.status(200).json({ success: true, complexity });
+  } catch (error) {
+    return sendServiceError(res, error, 'estimate submission complexity');
+  }
+};
+
 module.exports = {
+  estimateComplexity,
   explainError,
   generateHint,
+  reviewCode,
+  suggestOptimizations,
 };

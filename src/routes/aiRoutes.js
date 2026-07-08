@@ -8,6 +8,10 @@ const router = express.Router();
 
 router.use(verifyToken);
 
+const submissionIdValidation = body('submissionId')
+  .isMongoId()
+  .withMessage('A valid submission ID is required');
+
 router.post(
   '/hint',
   body('problemId').isMongoId().withMessage('A valid problem ID is required'),
@@ -16,8 +20,12 @@ router.post(
 
 router.post(
   '/explain-error',
-  body('submissionId').isMongoId().withMessage('A valid submission ID is required'),
+  submissionIdValidation,
   aiController.explainError
 );
+
+router.post('/code-review', submissionIdValidation, aiController.reviewCode);
+router.post('/optimize', submissionIdValidation, aiController.suggestOptimizations);
+router.post('/complexity', submissionIdValidation, aiController.estimateComplexity);
 
 module.exports = router;
